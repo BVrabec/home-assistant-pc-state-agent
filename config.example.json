@@ -1,0 +1,14 @@
+{
+  "broker": "192.168.1.50",
+  "port": 1883,
+  "username": "PUT-THE-MQTT-USERNAME-HERE",
+  "password": "PUT-THE-MQTT-PASSWORD-HERE",
+  "topic": "jarvis/pc/state",
+  "discovery_prefix": "homeassistant",
+  "device_id": "jarvis_desktop",
+  "device_name": "Personal Desktop",
+  "idle_seconds": 600,
+  "poll_seconds": 15,
+  "heartbeat_seconds": 120,
+  "client_id": "jarvis-pc-agent"
+}

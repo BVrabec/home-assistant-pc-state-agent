@@ -1,0 +1,2 @@
+# The real settings file lives on the PC and holds the MQTT password.
+config.json

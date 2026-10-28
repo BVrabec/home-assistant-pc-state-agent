@@ -1,0 +1,13 @@
+[Unit]
+Description=J.A.R.V.I.S. PC state agent (reports locked / idle / active to Home Assistant)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/jarvis-pc-agent
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

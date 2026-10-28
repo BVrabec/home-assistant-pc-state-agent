@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""jarvis-pc-agent — report this PC's state to Home Assistant over MQTT.
+
+Publishes to the topic in the config (default `jarvis/pc/state`), retained:
+
+    active  — on, unlocked, being used
+    idle    — on, unlocked, untouched for `idle_seconds`
+    locked  — on, screen locked
+    off     — published by the broker's last will if this program stops
+
+It also publishes the Home Assistant discovery record once, so the sensor
+appears in Home Assistant by itself — nothing in Home Assistant needs editing.
+
+What it reads: the session lock hint (loginctl) and the screen-saver idle time
+(whichever D-Bus call answers). Nothing else. No files, no screen, no keyboard,
+no internet, no AI. It speaks only to the broker on the home network.
+
+Config: ~/.config/jarvis-pc-agent/config.json  (see config.example.json)
+
+    jarvis-pc-agent --check     what it would send; connects to nothing
+    jarvis-pc-agent --probe     every way of reading idle and lock, raw —
+                                use this when a reading comes back empty
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG_PATH = Path(
+    os.environ.get("JARVIS_PC_AGENT_CONFIG")
+    or (Path.home() / ".config" / "jarvis-pc-agent" / "config.json")
+)
+
+DEFAULTS = {
+    "broker": "192.168.1.50",         # IP of the machine running your MQTT broker
+    "port": 1883,
+    "username": "",                   # the login made in Home Assistant
+    "password": "",
+    "topic": "jarvis/pc/state",
+    "discovery_prefix": "homeassistant",
+    "device_id": "jarvis_desktop",
+    "device_name": "Personal Desktop",
+    "idle_seconds": 600,              # untouched this long => idle
+    "poll_seconds": 15,
+    "heartbeat_seconds": 120,         # re-publish even when nothing changes
+    "client_id": "jarvis-pc-agent",
+}
+
+# Every way of asking "how long since the last input?", in order. The factor
+# turns the answer into seconds: the freedesktop name answers in seconds, KDE's
+# own name in milliseconds.
+IDLE_SOURCES = [
+    ("org.freedesktop.ScreenSaver (busctl)",
+     ["busctl", "--user", "call", "org.freedesktop.ScreenSaver", "/ScreenSaver",
+      "org.freedesktop.ScreenSaver", "GetSessionIdleTime"], 1.0),
+    ("org.kde.screensaver (busctl)",
+     ["busctl", "--user", "call", "org.kde.screensaver", "/ScreenSaver",
+      "org.freedesktop.ScreenSaver", "GetSessionIdleTime"], 0.001),
+    ("org.kde.screensaver (qdbus6)",
+     ["qdbus6", "org.kde.screensaver", "/ScreenSaver",
+      "org.freedesktop.ScreenSaver.GetSessionIdleTime"], 0.001),
+    ("org.kde.screensaver (qdbus)",
+     ["qdbus", "org.kde.screensaver", "/ScreenSaver",
+      "org.freedesktop.ScreenSaver.GetSessionIdleTime"], 0.001),
+    ("logind IdleSinceHintMonotonic", None, 1.0),
+]
+
+
+def log(msg: str) -> None:
+    print(f"jarvis-pc-agent: {msg}", file=sys.stderr, flush=True)
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+        except Exception as exc:
+            log(f"config at {CONFIG_PATH} is not valid JSON: {exc}")
+            raise SystemExit(2)
+    else:
+        log(f"no config at {CONFIG_PATH} — using defaults (no username, will not connect)")
+    return cfg
+
+
+def _run(cmd: list[str]) -> str:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return (out.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _run_full(cmd: list[str]) -> tuple[int, str, str]:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return out.returncode, (out.stdout or "").strip(), (out.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", "not installed"
+    except Exception as exc:
+        return 1, "", f"{type(exc).__name__}: {exc}"
+
+
+def session_id() -> str:
+    sid = (os.environ.get("XDG_SESSION_ID") or "").strip()
+    if sid:
+        return sid
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    for line in _run(["loginctl", "list-sessions", "--no-legend"]).splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == user:
+            return parts[0]
+    return ""
+
+
+def locked():
+    """True / False, or None when it cannot be read."""
+    sid = session_id()
+    if not sid:
+        return None
+    value = _run(["loginctl", "show-session", sid, "-p", "LockedHint", "--value"])
+    if value in ("yes", "no"):
+        return value == "yes"
+    return None
+
+
+def _loginctl(sid: str, prop: str) -> str:
+    if not sid:
+        return ""
+    return _run(["loginctl", "show-session", sid, "-p", prop, "--value"])
+
+
+def _idle_from_logind(sid: str):
+    """Idle seconds from logind's own idle hint, or None."""
+    if _loginctl(sid, "IdleHint") != "yes":
+        return None
+    try:
+        since_us = int(_loginctl(sid, "IdleSinceHintMonotonic"))
+    except ValueError:
+        return None
+    if since_us <= 0:
+        return None
+    try:
+        uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+    except Exception:
+        return None
+    return max(0.0, uptime_s - since_us / 1_000_000.0)
+
+
+def idle_seconds():
+    """Seconds since the last input, or None when no source answers."""
+    sid = session_id()
+    for _name, cmd, factor in IDLE_SOURCES:
+        if cmd is None:
+            value = _idle_from_logind(sid)
+            if value is not None:
+                return value
+            continue
+        out = _run(cmd)
+        numbers = [t for t in out.replace("=", " ").split() if t.isdigit()]
+        if numbers:
+            return int(numbers[-1]) * factor
+    return None
+
+
+def probe() -> int:
+    """Show every reading, raw, so a broken one can be seen rather than guessed."""
+    sid = session_id()
+    print(f"config      : {CONFIG_PATH}")
+    print(f"session id  : {sid or '(not found)'}")
+    print(f"LockedHint  : {_loginctl(sid, 'LockedHint') or '(nothing)'}")
+    print(f"IdleHint    : {_loginctl(sid, 'IdleHint') or '(nothing)'}")
+    print(f"IdleSince   : {_loginctl(sid, 'IdleSinceHintMonotonic') or '(nothing)'}  (microseconds since boot)")
+    print(f"uptime      : {_run(['cat', '/proc/uptime']).split(' ')[0] or '(unreadable)'} s")
+    print()
+    for name, cmd, factor in IDLE_SOURCES:
+        if cmd is None:
+            value = _idle_from_logind(sid)
+            print(f"{name}\n    -> {'(not idle / unavailable)' if value is None else f'{value:.0f} s'}")
+            continue
+        rc, out, err = _run_full(cmd)
+        raw = (out or err or "(no output)").replace("\n", " ")[:120]
+        parsed = [t for t in out.replace("=", " ").split() if t.isdigit()]
+        seconds = f"{int(parsed[-1]) * factor:.0f} s" if parsed else "—"
+        print(f"{name}\n    rc={rc}  raw={raw}\n    -> {seconds}")
+    print()
+    print("tools found :")
+    for tool in ("busctl", "qdbus6", "qdbus", "dbus-send", "loginctl"):
+        print(f"    {tool:10} {shutil.which(tool) or '(missing)'}")
+    return 0
+
+
+def state(cfg: dict) -> str:
+    lock = locked()
+    if lock is True:
+        return "locked"
+    idle = idle_seconds()
+    if idle is not None and idle >= int(cfg["idle_seconds"]):
+        return "idle"
+    return "active"
+
+
+def discovery_payload(cfg: dict) -> str:
+    return json.dumps({
+        "name": "PC state",
+        "unique_id": f"{cfg['device_id']}_state",
+        "state_topic": cfg["topic"],
+        "icon": "mdi:desktop-tower-monitor",
+        "device": {
+            "identifiers": [cfg["device_id"]],
+            "name": cfg["device_name"],
+            "manufacturer": "Vrabi Industries",
+        },
+    })
+
+
+def _make_client(mqtt, client_id: str):
+    """paho-mqtt 2.x wants the callback API version; 1.x has no such argument."""
+    try:
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+    except (AttributeError, TypeError):
+        return mqtt.Client(client_id=client_id)
+
+
+def check(cfg: dict) -> int:
+    """Print what would be sent, without connecting to anything."""
+    print(f"config        : {CONFIG_PATH}")
+    print(f"broker        : {cfg['broker']}:{cfg['port']}  user={cfg['username'] or '(none)'}")
+    print(f"topic         : {cfg['topic']}")
+    print(f"session id    : {session_id() or '(not found)'}")
+    print(f"locked        : {locked()}")
+    print(f"idle seconds  : {idle_seconds()}")
+    print(f"state now     : {state(cfg)}")
+    return 0
+
+
+CONNACK = {
+    0: "accepted",
+    1: "refused: wrong protocol version",
+    2: "refused: client id not allowed",
+    3: "refused: server unavailable",
+    4: "refused: bad username or password",
+    5: "refused: not authorised — the broker does not know this username and password",
+}
+
+
+def main() -> int:
+    cfg = load_config()
+    if "--probe" in sys.argv:
+        return probe()
+    if "--check" in sys.argv:
+        return check(cfg)          # works without the MQTT library installed
+
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        log("paho-mqtt is missing — install python3-paho-mqtt")
+        return 2
+
+    client = _make_client(mqtt, cfg["client_id"])
+    if cfg["username"]:
+        client.username_pw_set(cfg["username"], cfg["password"])
+    client.will_set(cfg["topic"], "off", retain=True)
+    client.reconnect_delay_set(min_delay=2, max_delay=60)
+
+    disc_topic = f"{cfg['discovery_prefix']}/sensor/{cfg['device_id']}/state/config"
+
+    def on_connect(c, userdata, flags, reason_code, properties=None):
+        code = getattr(reason_code, "value", reason_code)
+        if code != 0:
+            log(f"{cfg['broker']}:{cfg['port']} -> {CONNACK.get(code, f'refused (code {code})')}")
+            return
+        log(f"connected to {cfg['broker']}:{cfg['port']} as {cfg['username'] or '(anonymous)'}")
+        c.publish(disc_topic, discovery_payload(cfg), retain=True)
+        c.publish(cfg["topic"], state(cfg), retain=True)
+
+    client.on_connect = on_connect
+    client.loop_start()
+
+    last_state, last_publish, last_note = None, 0.0, None
+    while True:
+        try:
+            if not client.is_connected():
+                client.connect(cfg["broker"], int(cfg["port"]), keepalive=60)
+            now = time.time()
+            current = state(cfg)
+            if current != last_state or now - last_publish >= int(cfg["heartbeat_seconds"]):
+                client.publish(cfg["topic"], current, retain=True)
+                if current != last_state:
+                    log(f"state -> {current}")
+                last_state, last_publish = current, now
+        except Exception as exc:
+            note = f"{type(exc).__name__}: {exc}"
+            if note != last_note:            # one line per distinct problem, not a flood
+                log(f"loop error: {note}")
+                last_note = note
+        time.sleep(int(cfg["poll_seconds"]))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(0)
