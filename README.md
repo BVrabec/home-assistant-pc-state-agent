@@ -17,6 +17,19 @@ Linux PC  ──MQTT──▶  broker (on the Home Assistant host)  ──▶  H
 - It runs as **your own user**, in your own login session, as a systemd *user* service. No root, no
   second account, no system-wide changes.
 
+## Why this repo exists
+
+Home Assistant could already see whether the PC was **on** — a ping sensor does that. It could not
+tell *"the PC is on"* from *"he is sitting at it"*, and a great many automations want exactly that
+difference: ring or stay quiet, is he at the computer or away, has he stepped out of the room.
+
+This agent closes that gap. It runs on the PC itself, publishes one of four words over MQTT, and
+Home Assistant turns it into a sensor that an automation — or an assistant — can read.
+
+**What is in here:** the program, the systemd user unit, an install script, a settings example, and a
+guide in two halves — *install it on the Linux PC*, then *connect it to Home Assistant*. Enough to
+rebuild the whole thing from scratch, on this machine or any other.
+
 ## What it reports
 
 | State    | Meaning                                                          |
